@@ -1,0 +1,222 @@
+/**
+ * routes/shops.js
+ *
+ * All shop-related routes:
+ * - Admin: register a shop, list all shops with stats
+ * - Public: look up a single shop's name (for customer/shopkeeper UIs)
+ * - Shopkeeper self-service: login, change PIN, change Shop ID
+ */
+
+const express = require("express");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
+
+const Shop = require("../models/Shop");
+const Order = require("../models/Order");
+const requireAdmin = require("../middleware/requireAdmin");
+const requireShopAuth = require("../middleware/requireShopAuth");
+
+const router = express.Router();
+
+function slugify(shopName) {
+  const slug = shopName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+  const suffix = Math.random().toString(36).slice(2, 6);
+  return `${slug}-${suffix}`;
+}
+
+/**
+ * POST /shops/register
+ * Admin-only. Onboards a new shop with an auto-generated shopId and an
+ * initial PIN (defaults to "123456" if none given — shopkeeper should
+ * change it after first login).
+ *
+ * Expected body: { shopName, ownerPhone, city, email, initialPin }
+ */
+router.post("/shops/register", requireAdmin, async (req, res) => {
+  try {
+    const { shopName, ownerPhone, city, email, initialPin } = req.body;
+    if (!shopName) return res.status(400).json({ error: "shopName is required." });
+
+    const shopId = slugify(shopName);
+    const pinHash = await bcrypt.hash(initialPin || "123456", 10);
+
+    const shop = await Shop.create({ shopId, shopName, ownerPhone, city, email, pinHash });
+    console.log(`New shop registered: ${shop.shopName} (${shop.shopId})`);
+    res.status(201).json(shop);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to register shop." });
+  }
+});
+
+/**
+ * GET /shops
+ * Admin-only — lists every registered shop with a quick stats summary.
+ */
+router.get("/shops", requireAdmin, async (req, res) => {
+  try {
+    const shops = await Shop.find().sort({ createdAt: -1 });
+
+    const shopsWithStats = await Promise.all(
+      shops.map(async (shop) => {
+        const orders = await Order.find({ shopId: shop.shopId });
+        const completed = orders.filter((o) => o.status === "completed");
+        const awaitingApproval = orders.filter((o) => o.status === "awaiting_approval");
+
+        const shopObj = shop.toObject();
+        delete shopObj.pinHash; // never expose the hash, even to the admin UI
+
+        return {
+          ...shopObj,
+          stats: {
+            totalOrders: orders.length,
+            completedOrders: completed.length,
+            awaitingApproval: awaitingApproval.length,
+            estimatedRevenue: completed.reduce((sum, o) => sum + (o.estimatedPrice || 0), 0),
+          },
+        };
+      })
+    );
+
+    res.json(shopsWithStats);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch shops." });
+  }
+});
+
+/**
+ * GET /shops/:shopId
+ * Public — used by customer and shopkeeper UIs to display the shop's name.
+ */
+router.get("/shops/:shopId", async (req, res) => {
+  try {
+    const shop = await Shop.findOne({ shopId: req.params.shopId }).select("-pinHash");
+    if (!shop) return res.status(404).json({ error: "Shop not found." });
+    res.json(shop);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch shop." });
+  }
+});
+
+/**
+ * POST /shops/login
+ * Shopkeeper login — Shop ID + PIN -> JWT token (valid 30 days).
+ */
+router.post("/shops/login", async (req, res) => {
+  try {
+    const { shopId, pin } = req.body;
+    if (!shopId || !pin) {
+      return res.status(400).json({ error: "shopId aur pin dono chahiye" });
+    }
+
+    const shop = await Shop.findOne({ shopId });
+    if (!shop || !shop.pinHash) {
+      return res.status(401).json({ error: "Galat Shop ID ya PIN" });
+    }
+
+    const valid = await bcrypt.compare(pin, shop.pinHash);
+    if (!valid) {
+      return res.status(401).json({ error: "Galat Shop ID ya PIN" });
+    }
+
+    const token = jwt.sign({ shopId: shop.shopId }, process.env.JWT_SECRET, {
+      expiresIn: "30d",
+    });
+
+    res.json({ token, shopId: shop.shopId, shopName: shop.shopName });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Login failed." });
+  }
+});
+
+/**
+ * POST /shops/:shopId/change-pin
+ * Logged-in shopkeeper changes their own PIN.
+ */
+router.post("/shops/:shopId/change-pin", requireShopAuth, async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    if (req.auth.shopId !== shopId) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+
+    const { oldPin, newPin } = req.body;
+    if (!/^\d{4,6}$/.test(newPin || "")) {
+      return res.status(400).json({ error: "PIN 4-6 digit ka number hona chahiye" });
+    }
+
+    const shop = await Shop.findOne({ shopId });
+    const valid = await bcrypt.compare(oldPin || "", shop.pinHash);
+    if (!valid) {
+      return res.status(401).json({ error: "Purana PIN galat hai" });
+    }
+
+    shop.pinHash = await bcrypt.hash(newPin, 10);
+    await shop.save();
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "PIN change failed." });
+  }
+});
+
+/**
+ * PATCH /shops/:shopId/shop-id
+ * Logged-in shopkeeper renames their own Shop ID. Updates every existing
+ * order to the new shopId inside a transaction, so order history doesn't
+ * get orphaned under the old shopId.
+ *
+ * Note: the old JWT (which has the old shopId baked in) stops matching
+ * after this — the shopkeeper frontend must log the user out and prompt
+ * a fresh login with the new Shop ID.
+ */
+router.patch("/shops/:shopId/shop-id", requireShopAuth, async (req, res) => {
+  const { shopId } = req.params;
+  if (req.auth.shopId !== shopId) {
+    return res.status(403).json({ error: "Not authorized" });
+  }
+
+  const { newShopId } = req.body;
+  if (!newShopId || !/^[a-z0-9-]{3,40}$/.test(newShopId)) {
+    return res.status(400).json({
+      error: "Shop ID sirf lowercase letters, numbers, hyphens allowed (min 3 chars)",
+    });
+  }
+
+  if (newShopId === shopId) {
+    return res.status(400).json({ error: "Ye to wahi Shop ID hai" });
+  }
+
+  const existing = await Shop.findOne({ shopId: newShopId });
+  if (existing) {
+    return res.status(409).json({ error: "Ye Shop ID pehle se liya hua hai" });
+  }
+
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const result = await Shop.updateOne({ shopId }, { shopId: newShopId }, { session });
+      if (result.matchedCount === 0) {
+        throw new Error("Shop not found");
+      }
+      await Order.updateMany({ shopId }, { shopId: newShopId }, { session });
+    });
+
+    res.json({ success: true, newShopId });
+  } catch (e) {
+    console.error("Shop ID change failed", e);
+    res.status(500).json({ error: "Shop ID change fail hua, dobara try karo" });
+  } finally {
+    session.endSession();
+  }
+});
+
+module.exports = router;

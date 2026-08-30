@@ -13,6 +13,8 @@ const shopSchema = new mongoose.Schema({
   shopName: { type: String, required: true },              // e.g. "Sharma Xerox & Stationers"
   ownerPhone: { type: String, default: null },
   city: { type: String, default: null },
+  email: { type: String, default: null },                  // used for forgot-PIN reset
+  pinHash: { type: String, default: null },                 // bcrypt hash — plain PIN never stored
 }, {
   timestamps: true,
 });
