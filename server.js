@@ -25,6 +25,20 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());           // allow the frontend (different port) to call this API
 app.use(express.json());
 
+/**
+ * Simple admin authentication — protects shop registration and the
+ * cross-shop admin views. Not full auth (no per-admin accounts), but
+ * enough to stop random people from registering shops or listing them.
+ * The admin frontend sends this key in the "x-admin-key" header.
+ */
+function requireAdmin(req, res, next) {
+  const key = req.header("x-admin-key");
+  if (!key || key !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: "Unauthorized." });
+  }
+  next();
+}
+
 // ---- Connect to MongoDB ----
 mongoose
   .connect(process.env.MONGO_URI)
@@ -52,7 +66,7 @@ const RATE_PER_PAGE_COLOR = 10;  // ₹10 per page color
  *
  * Expected body: { "shopName": "Sharma Xerox & Stationers", "ownerPhone": "9876543210", "city": "Panipat" }
  */
-app.post("/shops/register", async (req, res) => {
+app.post("/shops/register", requireAdmin, async (req, res) => {
   try {
     const { shopName, ownerPhone, city } = req.body;
     if (!shopName) return res.status(400).json({ error: "shopName is required." });
@@ -70,6 +84,41 @@ app.post("/shops/register", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to register shop." });
+  }
+});
+
+/**
+ * GET /shops
+ * Admin-only — lists every registered shop, each with a quick stats summary
+ * (total orders, completed, pending approval, estimated revenue from
+ * completed orders). Used by the admin dashboard.
+ */
+app.get("/shops", requireAdmin, async (req, res) => {
+  try {
+    const shops = await Shop.find().sort({ createdAt: -1 });
+
+    const shopsWithStats = await Promise.all(
+      shops.map(async (shop) => {
+        const orders = await Order.find({ shopId: shop.shopId });
+        const completed = orders.filter((o) => o.status === "completed");
+        const awaitingApproval = orders.filter((o) => o.status === "awaiting_approval");
+
+        return {
+          ...shop.toObject(),
+          stats: {
+            totalOrders: orders.length,
+            completedOrders: completed.length,
+            awaitingApproval: awaitingApproval.length,
+            estimatedRevenue: completed.reduce((sum, o) => sum + (o.estimatedPrice || 0), 0),
+          },
+        };
+      })
+    );
+
+    res.json(shopsWithStats);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch shops." });
   }
 });
 
@@ -269,10 +318,20 @@ app.post("/orders/:id/status", async (req, res) => {
 /**
  * GET /orders?shopId=shop_001
  * Full order history for a shop — used by the shopkeeper dashboard.
+ * Without a shopId, this would return every order across all shops,
+ * so that case requires the admin key.
  */
 app.get("/orders", async (req, res) => {
   try {
     const { shopId } = req.query;
+
+    if (!shopId) {
+      const key = req.header("x-admin-key");
+      if (!key || key !== process.env.ADMIN_KEY) {
+        return res.status(401).json({ error: "shopId is required, or use an admin key to fetch all orders." });
+      }
+    }
+
     const filter = shopId ? { shopId } : {};
     const orders = await Order.find(filter).sort({ createdAt: -1 });
     res.json(orders);
