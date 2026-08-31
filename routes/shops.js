@@ -219,4 +219,31 @@ router.patch("/shops/:shopId/shop-id", requireShopAuth, async (req, res) => {
   }
 });
 
+/**
+ * POST /shops/:shopId/admin-reset-pin
+ * Admin-only. For when a shopkeeper forgets their PIN — they call/message
+ * you, you hit this from the Admin Dashboard, and it generates a fresh
+ * random PIN which you read out to them over the phone. No email service
+ * needed. The plain PIN is only ever visible in this one response —
+ * only the hash is stored afterwards.
+ */
+router.post("/shops/:shopId/admin-reset-pin", requireAdmin, async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const shop = await Shop.findOne({ shopId });
+    if (!shop) return res.status(404).json({ error: "Shop not found." });
+
+    // 6-digit random PIN, e.g. "042817"
+    const newPin = Math.floor(100000 + Math.random() * 900000).toString();
+    shop.pinHash = await bcrypt.hash(newPin, 10);
+    await shop.save();
+
+    console.log(`Admin reset PIN for shop: ${shop.shopName} (${shop.shopId})`);
+    res.json({ success: true, newPin }); // only place the plain PIN is ever returned
+  } catch (err) {
+    console.error("Admin PIN reset failed", err);
+    res.status(500).json({ error: "PIN reset fail hua, dobara try karo." });
+  }
+});
+
 module.exports = router;

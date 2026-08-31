@@ -19,8 +19,10 @@ const mongoose = require("mongoose");
 const multer = require("multer");
 const { v2: cloudinary } = require("cloudinary");
 const streamifier = require("streamifier");
+const jwt = require("jsonwebtoken");
 const Order = require("./models/Order");
 const shopsRouter = require("./routes/shops");
+const requireShopAuth = require("./middleware/requireShopAuth");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -133,11 +135,15 @@ function estimatePageCount(pagesString) {
 /**
  * GET /orders/awaiting-approval?shopId=shop_001
  * Shopkeeper dashboard polls this to show new incoming requests.
+ * Requires the shopkeeper's own login token, matching this exact shopId.
  */
-app.get("/orders/awaiting-approval", async (req, res) => {
+app.get("/orders/awaiting-approval", requireShopAuth, async (req, res) => {
   try {
     const { shopId } = req.query;
     if (!shopId) return res.status(400).json({ error: "shopId query param is required." });
+    if (req.auth.shopId !== shopId) {
+      return res.status(403).json({ error: "Not authorized for this shop." });
+    }
 
     const orders = await Order.find({ shopId, status: "awaiting_approval" }).sort({ createdAt: 1 });
     res.json(orders);
@@ -150,12 +156,16 @@ app.get("/orders/awaiting-approval", async (req, res) => {
 /**
  * POST /orders/:id/approve
  * Shopkeeper approves an order (payment collected in person) -> moves to "pending"
- * so the Local Agent picks it up and prints it.
+ * so the Local Agent picks it up and prints it. Requires login, and the order
+ * must belong to the shop that's logged in.
  */
-app.post("/orders/:id/approve", async (req, res) => {
+app.post("/orders/:id/approve", requireShopAuth, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found." });
+    if (order.shopId !== req.auth.shopId) {
+      return res.status(403).json({ error: "Not authorized for this order." });
+    }
 
     order.status = "pending";
     await order.save();
@@ -171,12 +181,16 @@ app.post("/orders/:id/approve", async (req, res) => {
 /**
  * POST /orders/:id/reject
  * Shopkeeper rejects an order (e.g. can't fulfil it, customer didn't pay, etc).
+ * Requires login, and the order must belong to the shop that's logged in.
  */
-app.post("/orders/:id/reject", async (req, res) => {
+app.post("/orders/:id/reject", requireShopAuth, async (req, res) => {
   try {
     const { reason } = req.body;
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found." });
+    if (order.shopId !== req.auth.shopId) {
+      return res.status(403).json({ error: "Not authorized for this order." });
+    }
 
     order.status = "rejected";
     if (reason) order.statusMessage = reason;
@@ -231,15 +245,30 @@ app.post("/orders/:id/status", async (req, res) => {
 
 /**
  * GET /orders?shopId=shop_001
- * Full order history for a shop — used by the shopkeeper dashboard.
- * Without a shopId, this would return every order across all shops,
- * so that case requires the admin key.
+ * Full order history for a shop — used by the shopkeeper dashboard, so it
+ * requires that shop's own login token. Without a shopId, this returns
+ * every order across all shops, so that case requires the admin key instead.
  */
 app.get("/orders", async (req, res) => {
   try {
     const { shopId } = req.query;
 
-    if (!shopId) {
+    if (shopId) {
+      const authHeader = req.headers.authorization || "";
+      const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+      if (!token) return res.status(401).json({ error: "Login required" });
+
+      let payload;
+      try {
+        payload = jwt.verify(token, process.env.JWT_SECRET);
+      } catch (e) {
+        return res.status(401).json({ error: "Session expire ho gaya, dobara login karo" });
+      }
+
+      if (payload.shopId !== shopId) {
+        return res.status(403).json({ error: "Not authorized for this shop." });
+      }
+    } else {
       const key = req.header("x-admin-key");
       if (!key || key !== process.env.ADMIN_KEY) {
         return res.status(401).json({ error: "shopId is required, or use an admin key to fetch all orders." });
