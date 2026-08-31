@@ -11,6 +11,7 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
+const crypto = require("crypto");
 
 const Shop = require("../models/Shop");
 const Order = require("../models/Order");
@@ -243,6 +244,31 @@ router.post("/shops/:shopId/admin-reset-pin", requireAdmin, async (req, res) => 
   } catch (err) {
     console.error("Admin PIN reset failed", err);
     res.status(500).json({ error: "PIN reset fail hua, dobara try karo." });
+  }
+});
+
+/**
+ * POST /shops/:shopId/agent-key
+ * Admin-only. Generates a fresh random agent key for a shop's Local Agent
+ * and stores its hash. The plain key is only ever shown in this one
+ * response — paste it into that shop's config.json ("agent_key" field).
+ * Calling this again rotates the key, invalidating the old one.
+ */
+router.post("/shops/:shopId/agent-key", requireAdmin, async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const shop = await Shop.findOne({ shopId });
+    if (!shop) return res.status(404).json({ error: "Shop not found." });
+
+    const agentKey = crypto.randomBytes(24).toString("hex");
+    shop.agentKeyHash = await bcrypt.hash(agentKey, 10);
+    await shop.save();
+
+    console.log(`Agent key generated for shop: ${shop.shopName} (${shop.shopId})`);
+    res.json({ success: true, agentKey });
+  } catch (err) {
+    console.error("Agent key generation failed", err);
+    res.status(500).json({ error: "Agent key generate nahi ho paayi." });
   }
 });
 

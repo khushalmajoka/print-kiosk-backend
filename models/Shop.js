@@ -15,6 +15,7 @@ const shopSchema = new mongoose.Schema({
   city: { type: String, default: null },
   email: { type: String, default: null },                  // used for forgot-PIN reset
   pinHash: { type: String, default: null },                 // bcrypt hash — plain PIN never stored
+  agentKeyHash: { type: String, default: null },            // bcrypt hash of the Local Agent's credential
 }, {
   timestamps: true,
 });

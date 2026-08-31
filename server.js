@@ -23,6 +23,7 @@ const jwt = require("jsonwebtoken");
 const Order = require("./models/Order");
 const shopsRouter = require("./routes/shops");
 const requireShopAuth = require("./middleware/requireShopAuth");
+const { requireAgentAuth, verifyAgentKey } = require("./middleware/requireAgentAuth");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -207,8 +208,10 @@ app.post("/orders/:id/reject", requireShopAuth, async (req, res) => {
 /**
  * GET /orders/pending?shopId=shop_001
  * Local Agent polls this — only approved (status: "pending") orders show up here.
+ * Requires that shop's agent key (header: x-agent-key), set up once from
+ * the Admin Dashboard and stored in the agent's config.json.
  */
-app.get("/orders/pending", async (req, res) => {
+app.get("/orders/pending", requireAgentAuth, async (req, res) => {
   try {
     const { shopId } = req.query;
     if (!shopId) return res.status(400).json({ error: "shopId query param is required." });
@@ -224,12 +227,23 @@ app.get("/orders/pending", async (req, res) => {
 /**
  * POST /orders/:id/status
  * Local Agent calls this after attempting to print, to report the outcome.
+ * Body must include shopId + agentKey (verified against that shop's agent
+ * key) so a random caller can't spoof status updates for someone else's order.
  */
 app.post("/orders/:id/status", async (req, res) => {
   try {
-    const { status, message } = req.body;
+    const { status, message, shopId, agentKey } = req.body;
+
+    const ok = await verifyAgentKey(shopId, agentKey);
+    if (!ok) {
+      return res.status(401).json({ error: "Agent key missing ya invalid hai." });
+    }
+
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found." });
+    if (order.shopId !== shopId) {
+      return res.status(403).json({ error: "Ye order is shop ka nahi hai." });
+    }
 
     order.status = status;
     if (message) order.statusMessage = message;
