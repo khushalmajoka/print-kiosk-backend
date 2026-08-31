@@ -23,7 +23,7 @@ const jwt = require("jsonwebtoken");
 const Order = require("./models/Order");
 const shopsRouter = require("./routes/shops");
 const requireShopAuth = require("./middleware/requireShopAuth");
-const { requireAgentAuth, verifyAgentKey } = require("./middleware/requireAgentAuth");
+const { requireAgentAuth, checkAgentAuth, AGENT_AUTH_ERROR_MESSAGES } = require("./middleware/requireAgentAuth");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -234,9 +234,13 @@ app.post("/orders/:id/status", async (req, res) => {
   try {
     const { status, message, shopId, agentKey } = req.body;
 
-    const ok = await verifyAgentKey(shopId, agentKey);
-    if (!ok) {
-      return res.status(401).json({ error: "Agent key missing ya invalid hai." });
+    const authResult = await checkAgentAuth(shopId, agentKey);
+    if (!authResult.ok) {
+      console.warn(`Agent auth rejected for shopId="${shopId}": ${authResult.reason}`);
+      return res.status(401).json({
+        error: AGENT_AUTH_ERROR_MESSAGES[authResult.reason],
+        reason: authResult.reason,
+      });
     }
 
     const order = await Order.findById(req.params.id);
