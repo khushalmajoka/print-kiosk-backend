@@ -29,6 +29,7 @@ const Shop = require("./models/Shop");
 const shopsRouter = require("./routes/shops");
 const requireShopAuth = require("./middleware/requireShopAuth");
 const { requireAgentAuth, checkAgentAuth, AGENT_AUTH_ERROR_MESSAGES } = require("./middleware/requireAgentAuth");
+const { generalLimiter, writeLimiter } = require("./middleware/rateLimiters");
 const pricing = require("./utils/pricing");
 
 const app = express();
@@ -41,6 +42,7 @@ const EXPIRY_SWEEP_INTERVAL_MS = 60 * 1000;
 
 app.use(cors());           // allow the frontend (different port) to call this API
 app.use(express.json());
+app.use(generalLimiter);   // broad safety net — see middleware/rateLimiters.js for the specific, stricter limiters on login/upload/orders
 
 // ---- Connect to MongoDB ----
 mongoose
@@ -142,7 +144,7 @@ app.get("/pricing", async (req, res) => {
  * returned as null and the frontend should fall back to manual entry —
  * upload still succeeds either way.
  */
-app.post("/upload", uploadSingleFile, async (req, res) => {
+app.post("/upload", writeLimiter, uploadSingleFile, async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "No file provided." });
   }
@@ -196,7 +198,7 @@ app.post("/upload", uploadSingleFile, async (req, res) => {
  *
  * Expected body: { shopId, files: [{ pages, copies, color, pageCount }] }
  */
-app.post("/orders/estimate", async (req, res) => {
+app.post("/orders/estimate", writeLimiter, async (req, res) => {
   try {
     const { shopId, files } = req.body;
     if (!files || !Array.isArray(files)) {
@@ -226,7 +228,7 @@ app.post("/orders/estimate", async (req, res) => {
  *   ]
  * }
  */
-app.post("/orders", async (req, res) => {
+app.post("/orders", writeLimiter, async (req, res) => {
   try {
     const { shopId, files } = req.body;
 

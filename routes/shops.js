@@ -17,6 +17,7 @@ const Shop = require("../models/Shop");
 const Order = require("../models/Order");
 const requireAdmin = require("../middleware/requireAdmin");
 const requireShopAuth = require("../middleware/requireShopAuth");
+const { loginLimiter } = require("../middleware/rateLimiters");
 
 const router = express.Router();
 
@@ -109,7 +110,7 @@ router.get("/shops/:shopId", async (req, res) => {
  * POST /shops/login
  * Shopkeeper login — Shop ID + PIN -> JWT token (valid 30 days).
  */
-router.post("/shops/login", async (req, res) => {
+router.post("/shops/login", loginLimiter, async (req, res) => {
   try {
     const { shopId, pin } = req.body;
     if (!shopId || !pin) {
