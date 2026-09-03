@@ -25,6 +25,7 @@ const { PDFDocument } = require("pdf-lib");
 const streamifier = require("streamifier");
 const jwt = require("jsonwebtoken");
 const Order = require("./models/Order");
+const Shop = require("./models/Shop");
 const shopsRouter = require("./routes/shops");
 const requireShopAuth = require("./middleware/requireShopAuth");
 const { requireAgentAuth, checkAgentAuth, AGENT_AUTH_ERROR_MESSAGES } = require("./middleware/requireAgentAuth");
@@ -57,14 +58,21 @@ cloudinary.config({
 // multer stores the incoming file in memory temporarily before we stream it to Cloudinary.
 // A hard size limit is enforced here too (not just in the frontend), so a
 // direct API call can't bypass the Cloudinary free-tier per-file cap.
+// Only PDFs are accepted — this is a print kiosk, not a general file host.
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: pricing.MAX_FILE_SIZE_BYTES },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype !== "application/pdf") {
+      return cb(new Error("NOT_A_PDF"));
+    }
+    cb(null, true);
+  },
 });
 
 /**
- * Wraps multer's upload.single("file") so an oversized file returns a
- * clean JSON error instead of multer's default plain-text/HTML response.
+ * Wraps multer's upload.single("file") so a rejected/oversized file returns
+ * a clean JSON error instead of multer's default plain-text/HTML response.
  */
 function uploadSingleFile(req, res, next) {
   upload.single("file")(req, res, (err) => {
@@ -73,6 +81,9 @@ function uploadSingleFile(req, res, next) {
         return res.status(413).json({
           error: `File is too large. The maximum allowed size is ${pricing.MAX_FILE_SIZE_MB}MB per file.`,
         });
+      }
+      if (err.message === "NOT_A_PDF") {
+        return res.status(400).json({ error: "Only PDF files are supported. Please upload a .pdf file." });
       }
       console.error("File upload error:", err);
       return res.status(400).json({ error: "File upload failed." });
@@ -95,17 +106,28 @@ app.get("/health", (req, res) => {
 });
 
 /**
- * GET /pricing
- * Returns the current per-page rates and file-size limit, so the frontend
- * never has to hardcode these numbers itself — it always reflects whatever
- * is set in utils/pricing.js.
+ * GET /pricing?shopId=shop_001
+ * Returns the effective per-page rates and file-size limit for a shop —
+ * that shop's own custom rates (Settings -> Print Rates) if they've set
+ * any, otherwise the platform defaults. Without a shopId, always returns
+ * the platform defaults. The frontend never hardcodes these numbers
+ * itself — it always reflects whatever is actually in the database.
  */
-app.get("/pricing", (req, res) => {
-  res.json({
-    ratePerPageBW: pricing.RATE_PER_PAGE_BW,
-    ratePerPageColor: pricing.RATE_PER_PAGE_COLOR,
-    maxFileSizeMB: pricing.MAX_FILE_SIZE_MB,
-  });
+app.get("/pricing", async (req, res) => {
+  try {
+    const { shopId } = req.query;
+    const shop = shopId ? await Shop.findOne({ shopId }).select("ratePerPageBW ratePerPageColor") : null;
+    const rates = pricing.effectiveRates(shop);
+
+    res.json({
+      ratePerPageBW: rates.bw,
+      ratePerPageColor: rates.color,
+      maxFileSizeMB: pricing.MAX_FILE_SIZE_MB,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch pricing." });
+  }
 });
 
 /**
@@ -125,15 +147,27 @@ app.post("/upload", uploadSingleFile, async (req, res) => {
     return res.status(400).json({ error: "No file provided." });
   }
 
-  let pageCount = null;
-  if (req.file.mimetype === "application/pdf") {
-    try {
-      const pdfDoc = await PDFDocument.load(req.file.buffer, { ignoreEncryption: true });
-      pageCount = pdfDoc.getPageCount();
-    } catch (err) {
-      console.warn(`Could not detect page count for "${req.file.originalname}": ${err.message}`);
-      // pageCount stays null — frontend falls back to manual entry
+  // fileFilter above already guarantees this is a PDF by mimetype, but that
+  // only checks the declared Content-Type — it says nothing about whether
+  // the file is actually a valid, readable PDF. Try to actually parse it:
+  // this is also where corrupted files and password-protected PDFs get
+  // caught and rejected with a clear reason, instead of silently accepting
+  // a file the Local Agent won't be able to print later.
+  let pageCount;
+  try {
+    const pdfDoc = await PDFDocument.load(req.file.buffer);
+    pageCount = pdfDoc.getPageCount();
+  } catch (err) {
+    const message = (err && err.message) || "";
+    if (message.toLowerCase().includes("encrypt")) {
+      return res.status(400).json({
+        error: "This PDF is password-protected. Please remove the password and upload it again.",
+      });
     }
+    console.warn(`Rejected unreadable PDF "${req.file.originalname}": ${message}`);
+    return res.status(400).json({
+      error: "This PDF appears to be corrupted or invalid. Please try re-saving or re-exporting it and upload again.",
+    });
   }
 
   const uploadStream = cloudinary.uploader.upload_stream(
@@ -157,16 +191,24 @@ app.post("/upload", uploadSingleFile, async (req, res) => {
  * POST /orders/estimate
  * Stateless price preview — same pricing logic as order creation, but
  * doesn't touch the database. The Customer UI calls this so the total it
- * shows always matches utils/pricing.js exactly (no duplicated formula).
+ * shows always matches utils/pricing.js exactly (no duplicated formula),
+ * and always reflects that specific shop's own rates if they've set any.
  *
- * Expected body: { files: [{ pages, copies, color, pageCount }] }
+ * Expected body: { shopId, files: [{ pages, copies, color, pageCount }] }
  */
-app.post("/orders/estimate", (req, res) => {
-  const { files } = req.body;
-  if (!files || !Array.isArray(files)) {
-    return res.status(400).json({ error: "A files array is required." });
+app.post("/orders/estimate", async (req, res) => {
+  try {
+    const { shopId, files } = req.body;
+    if (!files || !Array.isArray(files)) {
+      return res.status(400).json({ error: "A files array is required." });
+    }
+    const shop = shopId ? await Shop.findOne({ shopId }).select("ratePerPageBW ratePerPageColor") : null;
+    const rates = pricing.effectiveRates(shop);
+    res.json({ estimatedPrice: pricing.calculateOrderPrice(files, rates) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to calculate estimate." });
   }
-  res.json({ estimatedPrice: pricing.calculateOrderPrice(files) });
 });
 
 /**
@@ -192,7 +234,9 @@ app.post("/orders", async (req, res) => {
       return res.status(400).json({ error: "shopId and a non-empty files array are required." });
     }
 
-    const estimatedPrice = pricing.calculateOrderPrice(files);
+    const shop = await Shop.findOne({ shopId }).select("ratePerPageBW ratePerPageColor");
+    const rates = pricing.effectiveRates(shop);
+    const estimatedPrice = pricing.calculateOrderPrice(files, rates);
 
     const newOrder = await Order.create({ shopId, files, estimatedPrice });
 

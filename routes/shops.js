@@ -221,6 +221,46 @@ router.patch("/shops/:shopId/shop-id", requireShopAuth, async (req, res) => {
 });
 
 /**
+ * PATCH /shops/:shopId/pricing
+ * Logged-in shopkeeper sets their own per-page print rates (Settings ->
+ * Print Rates). Send null (or omit/empty-string) for a field to clear it
+ * back to the platform default instead of a custom value.
+ *
+ * Expected body: { ratePerPageBW, ratePerPageColor } — either field optional.
+ */
+router.patch("/shops/:shopId/pricing", requireShopAuth, async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    if (req.auth.shopId !== shopId) {
+      return res.status(403).json({ error: "Not authorized." });
+    }
+
+    const { ratePerPageBW, ratePerPageColor } = req.body;
+    const updates = {};
+
+    for (const [field, value] of Object.entries({ ratePerPageBW, ratePerPageColor })) {
+      if (value === null || value === undefined || value === "") {
+        updates[field] = null; // explicit clear -> falls back to the platform default
+        continue;
+      }
+      const num = Number(value);
+      if (isNaN(num) || num <= 0) {
+        return res.status(400).json({ error: `${field} must be a positive number.` });
+      }
+      updates[field] = num;
+    }
+
+    const shop = await Shop.findOneAndUpdate({ shopId }, updates, { new: true }).select("-pinHash");
+    if (!shop) return res.status(404).json({ error: "Shop not found." });
+
+    res.json(shop);
+  } catch (err) {
+    console.error("Pricing update failed", err);
+    res.status(500).json({ error: "Failed to update print rates." });
+  }
+});
+
+/**
  * POST /shops/:shopId/admin-reset-pin
  * Admin-only. For when a shopkeeper forgets their PIN — they call/message
  * you, you hit this from the Admin Dashboard, and it generates a fresh

@@ -16,6 +16,12 @@ const shopSchema = new mongoose.Schema({
   email: { type: String, default: null },                  // used for forgot-PIN reset
   pinHash: { type: String, default: null },                 // bcrypt hash — plain PIN never stored
   agentKeyHash: { type: String, default: null },            // bcrypt hash of the Local Agent's credential
+
+  // Per-shop print rates, set by the shopkeeper from Settings -> Print Rates.
+  // null (the default) means "use the platform default rate" — see
+  // utils/pricing.js's effectiveRates().
+  ratePerPageBW: { type: Number, default: null },
+  ratePerPageColor: { type: Number, default: null },
 }, {
   timestamps: true,
 });

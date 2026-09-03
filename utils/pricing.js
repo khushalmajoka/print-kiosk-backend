@@ -50,20 +50,38 @@ function estimatePageCount(pagesString, detectedPageCount) {
 }
 
 /**
+ * Works out a shop's effective per-page rates: the shop's own custom rate
+ * if they've set one (Settings -> Print Rates), otherwise the platform
+ * default. `shop` can be null/undefined (falls back to defaults entirely) —
+ * makes this safe to call even when a shop lookup came back empty.
+ *
+ * Uses ?? rather than || so a shop that deliberately sets a rate of 0
+ * (e.g. free B&W printing) is respected instead of being overridden.
+ */
+function effectiveRates(shop) {
+  return {
+    bw: shop && shop.ratePerPageBW != null ? shop.ratePerPageBW : RATE_PER_PAGE_BW,
+    color: shop && shop.ratePerPageColor != null ? shop.ratePerPageColor : RATE_PER_PAGE_COLOR,
+  };
+}
+
+/**
  * Price for one file entry.
  * Expects: { pages, copies, color, pageCount } — `pageCount` is the
  * detected count from upload (may be null), `pages` is the customer's
- * optional manual range.
+ * optional manual range. `rates` is a { bw, color } pair from
+ * effectiveRates() — defaults to the platform rates if omitted.
  */
-function calculateFilePrice(file) {
+function calculateFilePrice(file, rates) {
   const pageCount = estimatePageCount(file.pages, file.pageCount);
-  const rate = file.color ? RATE_PER_PAGE_COLOR : RATE_PER_PAGE_BW;
+  const r = rates || { bw: RATE_PER_PAGE_BW, color: RATE_PER_PAGE_COLOR };
+  const rate = file.color ? r.color : r.bw;
   return pageCount * rate * (Number(file.copies) || 1);
 }
 
-/** Total price across every file in an order. */
-function calculateOrderPrice(files) {
-  return (files || []).reduce((total, file) => total + calculateFilePrice(file), 0);
+/** Total price across every file in an order, at the given shop's rates. */
+function calculateOrderPrice(files, rates) {
+  return (files || []).reduce((total, file) => total + calculateFilePrice(file, rates), 0);
 }
 
 module.exports = {
@@ -72,6 +90,7 @@ module.exports = {
   MAX_FILE_SIZE_MB,
   MAX_FILE_SIZE_BYTES,
   estimatePageCount,
+  effectiveRates,
   calculateFilePrice,
   calculateOrderPrice,
 };
