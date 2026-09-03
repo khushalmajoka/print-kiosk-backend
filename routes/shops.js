@@ -113,17 +113,17 @@ router.post("/shops/login", async (req, res) => {
   try {
     const { shopId, pin } = req.body;
     if (!shopId || !pin) {
-      return res.status(400).json({ error: "shopId aur pin dono chahiye" });
+      return res.status(400).json({ error: "Shop ID and PIN are both required." });
     }
 
     const shop = await Shop.findOne({ shopId });
     if (!shop || !shop.pinHash) {
-      return res.status(401).json({ error: "Galat Shop ID ya PIN" });
+      return res.status(401).json({ error: "Incorrect Shop ID or PIN." });
     }
 
     const valid = await bcrypt.compare(pin, shop.pinHash);
     if (!valid) {
-      return res.status(401).json({ error: "Galat Shop ID ya PIN" });
+      return res.status(401).json({ error: "Incorrect Shop ID or PIN." });
     }
 
     const token = jwt.sign({ shopId: shop.shopId }, process.env.JWT_SECRET, {
@@ -145,18 +145,18 @@ router.post("/shops/:shopId/change-pin", requireShopAuth, async (req, res) => {
   try {
     const { shopId } = req.params;
     if (req.auth.shopId !== shopId) {
-      return res.status(403).json({ error: "Not authorized" });
+      return res.status(403).json({ error: "Not authorized." });
     }
 
     const { oldPin, newPin } = req.body;
     if (!/^\d{4,6}$/.test(newPin || "")) {
-      return res.status(400).json({ error: "PIN 4-6 digit ka number hona chahiye" });
+      return res.status(400).json({ error: "New PIN must be a 4-6 digit number." });
     }
 
     const shop = await Shop.findOne({ shopId });
     const valid = await bcrypt.compare(oldPin || "", shop.pinHash);
     if (!valid) {
-      return res.status(401).json({ error: "Purana PIN galat hai" });
+      return res.status(401).json({ error: "Current PIN is incorrect." });
     }
 
     shop.pinHash = await bcrypt.hash(newPin, 10);
@@ -182,23 +182,23 @@ router.post("/shops/:shopId/change-pin", requireShopAuth, async (req, res) => {
 router.patch("/shops/:shopId/shop-id", requireShopAuth, async (req, res) => {
   const { shopId } = req.params;
   if (req.auth.shopId !== shopId) {
-    return res.status(403).json({ error: "Not authorized" });
+    return res.status(403).json({ error: "Not authorized." });
   }
 
   const { newShopId } = req.body;
   if (!newShopId || !/^[a-z0-9-]{3,40}$/.test(newShopId)) {
     return res.status(400).json({
-      error: "Shop ID sirf lowercase letters, numbers, hyphens allowed (min 3 chars)",
+      error: "Shop ID can only contain lowercase letters, numbers, and hyphens (minimum 3 characters).",
     });
   }
 
   if (newShopId === shopId) {
-    return res.status(400).json({ error: "Ye to wahi Shop ID hai" });
+    return res.status(400).json({ error: "That's already your current Shop ID." });
   }
 
   const existing = await Shop.findOne({ shopId: newShopId });
   if (existing) {
-    return res.status(409).json({ error: "Ye Shop ID pehle se liya hua hai" });
+    return res.status(409).json({ error: "This Shop ID is already taken." });
   }
 
   const session = await mongoose.startSession();
@@ -214,7 +214,7 @@ router.patch("/shops/:shopId/shop-id", requireShopAuth, async (req, res) => {
     res.json({ success: true, newShopId });
   } catch (e) {
     console.error("Shop ID change failed", e);
-    res.status(500).json({ error: "Shop ID change fail hua, dobara try karo" });
+    res.status(500).json({ error: "Shop ID change failed. Please try again." });
   } finally {
     session.endSession();
   }
@@ -243,7 +243,7 @@ router.post("/shops/:shopId/admin-reset-pin", requireAdmin, async (req, res) => 
     res.json({ success: true, newPin }); // only place the plain PIN is ever returned
   } catch (err) {
     console.error("Admin PIN reset failed", err);
-    res.status(500).json({ error: "PIN reset fail hua, dobara try karo." });
+    res.status(500).json({ error: "PIN reset failed. Please try again." });
   }
 });
 
@@ -268,7 +268,7 @@ router.post("/shops/:shopId/agent-key", requireAdmin, async (req, res) => {
     res.json({ success: true, agentKey });
   } catch (err) {
     console.error("Agent key generation failed", err);
-    res.status(500).json({ error: "Agent key generate nahi ho paayi." });
+    res.status(500).json({ error: "Failed to generate agent key." });
   }
 });
 

@@ -48,11 +48,11 @@ async function checkAgentAuth(shopId, agentKey) {
 }
 
 const AGENT_AUTH_ERROR_MESSAGES = {
-  "missing-fields": "shopId ya agent key request mein missing hai.",
+  "missing-fields": "shopId or agent key is missing from the request.",
   "shop-not-found":
-    "Ye shopId backend mein nahi mila. Agar Shop ID recently change hui hai, config.json mein shop_id update karo.",
+    "This shopId was not found on the server. If the Shop ID was changed recently, update shop_id in config.json to match.",
   "invalid-key":
-    "Agent key is shop ke liye match nahi hui. Ho sakta hai key rotate ho gayi ho — Admin Dashboard se fresh key generate karke config.json update karo.",
+    "The agent key doesn't match this shop's stored key. It may have been rotated — generate a fresh key from the Admin Dashboard and update config.json.",
 };
 
 // Backward-compatible boolean helper (still used by routes that only need a yes/no).

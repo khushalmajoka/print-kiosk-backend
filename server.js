@@ -8,6 +8,9 @@
  * 2. Shopkeeper sees it on their dashboard, collects payment in person, clicks Approve
  * 3. Order becomes "pending" -> Local Agent picks it up, prints it, reports back
  *
+ * If the shopkeeper doesn't approve within ORDER_EXPIRY_MINUTES, a background
+ * sweep marks the order "expired" so it doesn't sit in the queue forever.
+ *
  * Shop registration, shop listing, and shopkeeper self-service auth
  * (login / change PIN / change Shop ID) now live in routes/shops.js.
  */
@@ -18,15 +21,22 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const multer = require("multer");
 const { v2: cloudinary } = require("cloudinary");
+const { PDFDocument } = require("pdf-lib");
 const streamifier = require("streamifier");
 const jwt = require("jsonwebtoken");
 const Order = require("./models/Order");
 const shopsRouter = require("./routes/shops");
 const requireShopAuth = require("./middleware/requireShopAuth");
 const { requireAgentAuth, checkAgentAuth, AGENT_AUTH_ERROR_MESSAGES } = require("./middleware/requireAgentAuth");
+const pricing = require("./utils/pricing");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// How long a shopkeeper has to approve an order before it auto-expires.
+const ORDER_EXPIRY_MINUTES = 10;
+// How often the expiry sweep checks for stale orders.
+const EXPIRY_SWEEP_INTERVAL_MS = 60 * 1000;
 
 app.use(cors());           // allow the frontend (different port) to call this API
 app.use(express.json());
@@ -44,24 +54,86 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// multer stores the incoming file in memory temporarily before we stream it to Cloudinary
-const upload = multer({ storage: multer.memoryStorage() });
+// multer stores the incoming file in memory temporarily before we stream it to Cloudinary.
+// A hard size limit is enforced here too (not just in the frontend), so a
+// direct API call can't bypass the Cloudinary free-tier per-file cap.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: pricing.MAX_FILE_SIZE_BYTES },
+});
 
-// Simple pricing — adjust these rates to whatever the shop charges
-const RATE_PER_PAGE_BW = 2;      // ₹2 per page black & white
-const RATE_PER_PAGE_COLOR = 10;  // ₹10 per page color
+/**
+ * Wraps multer's upload.single("file") so an oversized file returns a
+ * clean JSON error instead of multer's default plain-text/HTML response.
+ */
+function uploadSingleFile(req, res, next) {
+  upload.single("file")(req, res, (err) => {
+    if (err) {
+      if (err.code === "LIMIT_FILE_SIZE") {
+        return res.status(413).json({
+          error: `File is too large. The maximum allowed size is ${pricing.MAX_FILE_SIZE_MB}MB per file.`,
+        });
+      }
+      console.error("File upload error:", err);
+      return res.status(400).json({ error: "File upload failed." });
+    }
+    next();
+  });
+}
 
 // ---- Shop routes: register, list, public lookup, login, change-pin, change-shop-id ----
 app.use(shopsRouter);
 
 /**
+ * GET /health
+ * Lightweight endpoint with no DB/Cloudinary work, used purely to keep the
+ * Render free-tier instance from going to sleep (and to let the frontend
+ * check whether the backend is awake before making a real request).
+ */
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+/**
+ * GET /pricing
+ * Returns the current per-page rates and file-size limit, so the frontend
+ * never has to hardcode these numbers itself — it always reflects whatever
+ * is set in utils/pricing.js.
+ */
+app.get("/pricing", (req, res) => {
+  res.json({
+    ratePerPageBW: pricing.RATE_PER_PAGE_BW,
+    ratePerPageColor: pricing.RATE_PER_PAGE_COLOR,
+    maxFileSizeMB: pricing.MAX_FILE_SIZE_MB,
+  });
+});
+
+/**
  * POST /upload
  * Accepts a single file (form field name: "file") and uploads it to Cloudinary.
  * Returns the hosted URL, which the frontend then includes in the order it creates.
+ *
+ * If the file is a PDF, also detects and returns its actual page count
+ * (pageCount) — the frontend can use this to pre-fill/validate the "pages"
+ * field instead of the customer typing it in manually. If detection fails
+ * (corrupt file, password-protected PDF, non-PDF file, etc.) pageCount is
+ * returned as null and the frontend should fall back to manual entry —
+ * upload still succeeds either way.
  */
-app.post("/upload", upload.single("file"), (req, res) => {
+app.post("/upload", uploadSingleFile, async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "No file provided." });
+  }
+
+  let pageCount = null;
+  if (req.file.mimetype === "application/pdf") {
+    try {
+      const pdfDoc = await PDFDocument.load(req.file.buffer, { ignoreEncryption: true });
+      pageCount = pdfDoc.getPageCount();
+    } catch (err) {
+      console.warn(`Could not detect page count for "${req.file.originalname}": ${err.message}`);
+      // pageCount stays null — frontend falls back to manual entry
+    }
   }
 
   const uploadStream = cloudinary.uploader.upload_stream(
@@ -74,7 +146,7 @@ app.post("/upload", upload.single("file"), (req, res) => {
         console.error("Cloudinary upload error:", error);
         return res.status(500).json({ error: "Upload failed." });
       }
-      res.json({ fileUrl: result.secure_url, fileName: req.file.originalname });
+      res.json({ fileUrl: result.secure_url, fileName: req.file.originalname, pageCount });
     }
   );
 
@@ -82,15 +154,33 @@ app.post("/upload", upload.single("file"), (req, res) => {
 });
 
 /**
+ * POST /orders/estimate
+ * Stateless price preview — same pricing logic as order creation, but
+ * doesn't touch the database. The Customer UI calls this so the total it
+ * shows always matches utils/pricing.js exactly (no duplicated formula).
+ *
+ * Expected body: { files: [{ pages, copies, color, pageCount }] }
+ */
+app.post("/orders/estimate", (req, res) => {
+  const { files } = req.body;
+  if (!files || !Array.isArray(files)) {
+    return res.status(400).json({ error: "A files array is required." });
+  }
+  res.json({ estimatedPrice: pricing.calculateOrderPrice(files) });
+});
+
+/**
  * POST /orders
  * Create a new order. Starts as "awaiting_approval" — the shopkeeper must
  * approve it (after collecting payment in person) before it gets printed.
+ * Auto-expires to "expired" if not approved within ORDER_EXPIRY_MINUTES
+ * (see the sweep near the bottom of this file).
  *
  * Expected body:
  * {
  *   "shopId": "shop_001",
  *   "files": [
- *     { "fileUrl": "...", "fileName": "resume.pdf", "pages": "1-2", "copies": 1, "color": false }
+ *     { "fileUrl": "...", "fileName": "resume.pdf", "pages": "1-2", "copies": 1, "color": false, "pageCount": 2 }
  *   ]
  * }
  */
@@ -102,14 +192,7 @@ app.post("/orders", async (req, res) => {
       return res.status(400).json({ error: "shopId and a non-empty files array are required." });
     }
 
-    // Very simple price estimate — assumes 1 page per file if "pages" isn't a range.
-    // This is informational only for now; real page-count detection comes later.
-    let estimatedPrice = 0;
-    for (const f of files) {
-      const pageCount = estimatePageCount(f.pages);
-      const rate = f.color ? RATE_PER_PAGE_COLOR : RATE_PER_PAGE_BW;
-      estimatedPrice += pageCount * rate * (f.copies || 1);
-    }
+    const estimatedPrice = pricing.calculateOrderPrice(files);
 
     const newOrder = await Order.create({ shopId, files, estimatedPrice });
 
@@ -120,18 +203,6 @@ app.post("/orders", async (req, res) => {
     res.status(500).json({ error: "Failed to create order." });
   }
 });
-
-function estimatePageCount(pagesString) {
-  if (!pagesString) return 1; // unknown -> assume 1 page for the estimate
-  if (pagesString.includes("-")) {
-    const [start, end] = pagesString.split("-").map(Number);
-    return Math.max(1, end - start + 1);
-  }
-  if (pagesString.includes(",")) {
-    return pagesString.split(",").length;
-  }
-  return 1;
-}
 
 /**
  * GET /orders/awaiting-approval?shopId=shop_001
@@ -158,7 +229,8 @@ app.get("/orders/awaiting-approval", requireShopAuth, async (req, res) => {
  * POST /orders/:id/approve
  * Shopkeeper approves an order (payment collected in person) -> moves to "pending"
  * so the Local Agent picks it up and prints it. Requires login, and the order
- * must belong to the shop that's logged in.
+ * must belong to the shop that's logged in. An order that already auto-expired
+ * can no longer be approved — the customer needs to place a new one.
  */
 app.post("/orders/:id/approve", requireShopAuth, async (req, res) => {
   try {
@@ -166,6 +238,9 @@ app.post("/orders/:id/approve", requireShopAuth, async (req, res) => {
     if (!order) return res.status(404).json({ error: "Order not found." });
     if (order.shopId !== req.auth.shopId) {
       return res.status(403).json({ error: "Not authorized for this order." });
+    }
+    if (order.status === "expired") {
+      return res.status(409).json({ error: "This order has expired and can no longer be approved." });
     }
 
     order.status = "pending";
@@ -246,7 +321,7 @@ app.post("/orders/:id/status", async (req, res) => {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found." });
     if (order.shopId !== shopId) {
-      return res.status(403).json({ error: "Ye order is shop ka nahi hai." });
+      return res.status(403).json({ error: "This order does not belong to your shop." });
     }
 
     order.status = status;
@@ -274,13 +349,13 @@ app.get("/orders", async (req, res) => {
     if (shopId) {
       const authHeader = req.headers.authorization || "";
       const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-      if (!token) return res.status(401).json({ error: "Login required" });
+      if (!token) return res.status(401).json({ error: "Login required." });
 
       let payload;
       try {
         payload = jwt.verify(token, process.env.JWT_SECRET);
       } catch (e) {
-        return res.status(401).json({ error: "Session expire ho gaya, dobara login karo" });
+        return res.status(401).json({ error: "Your session has expired. Please log in again." });
       }
 
       if (payload.shopId !== shopId) {
@@ -316,6 +391,27 @@ app.get("/orders/:id", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch order." });
   }
 });
+
+/**
+ * Background sweep: auto-expires any order still "awaiting_approval" after
+ * ORDER_EXPIRY_MINUTES. Runs on an interval rather than per-request so it
+ * catches orders even if nobody happens to poll around them.
+ */
+async function expireStaleOrders() {
+  try {
+    const cutoff = new Date(Date.now() - ORDER_EXPIRY_MINUTES * 60 * 1000);
+    const result = await Order.updateMany(
+      { status: "awaiting_approval", createdAt: { $lt: cutoff } },
+      { status: "expired", statusMessage: "Shop did not approve this order in time." }
+    );
+    if (result.modifiedCount > 0) {
+      console.log(`Expired ${result.modifiedCount} order(s) past the ${ORDER_EXPIRY_MINUTES}-minute approval window.`);
+    }
+  } catch (err) {
+    console.error("Order expiry sweep failed:", err);
+  }
+}
+setInterval(expireStaleOrders, EXPIRY_SWEEP_INTERVAL_MS);
 
 app.listen(PORT, () => {
   console.log(`Print kiosk backend running on http://localhost:${PORT}`);

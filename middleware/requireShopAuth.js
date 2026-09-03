@@ -5,7 +5,7 @@ function requireShopAuth(req, res, next) {
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
 
   if (!token) {
-    return res.status(401).json({ error: "Login required" });
+    return res.status(401).json({ error: "Login required." });
   }
 
   try {
@@ -13,7 +13,7 @@ function requireShopAuth(req, res, next) {
     req.auth = payload; // { shopId }
     next();
   } catch (e) {
-    return res.status(401).json({ error: "Session expire ho gaya, dobara login karo" });
+    return res.status(401).json({ error: "Your session has expired. Please log in again." });
   }
 }
 

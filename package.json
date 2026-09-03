@@ -18,6 +18,7 @@
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.9.4",
     "multer": "^2.3.0",
+    "pdf-lib": "^1.17.1",
     "streamifier": "^0.1.1"
   }
 }
