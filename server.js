@@ -40,7 +40,42 @@ const ORDER_EXPIRY_MINUTES = 10;
 // How often the expiry sweep checks for stale orders.
 const EXPIRY_SWEEP_INTERVAL_MS = 60 * 1000;
 
-app.use(cors());           // allow the frontend (different port) to call this API
+// ---- CORS: only allow requests from PrintKaro's own frontends ----
+//
+// Configure allowed origins via the ALLOWED_ORIGINS env var (comma-separated,
+// no spaces), e.g.:
+//   ALLOWED_ORIGINS=https://printkaro-customer.vercel.app,https://printkaro-shopowner.vercel.app,https://printkaro-admin.vercel.app
+//
+// Falls back to just the known Customer UI URL if the env var isn't set —
+// set ALLOWED_ORIGINS on Render (and in your local .env) with the real
+// Shopkeeper + Admin dashboard URLs so they aren't blocked.
+const DEFAULT_ALLOWED_ORIGINS = ["https://printkaro-customer.vercel.app"];
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+const effectiveAllowedOrigins = allowedOrigins.length > 0 ? allowedOrigins : DEFAULT_ALLOWED_ORIGINS;
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // No Origin header at all means this isn't a browser request — it's
+    // the Local Agent, curl, Postman, or a server-to-server call. CORS
+    // only exists to restrict *browsers*, so these are always allowed.
+    if (!origin) return callback(null, true);
+
+    // Always allow localhost on any port, for local development.
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+      return callback(null, true);
+    }
+
+    if (effectiveAllowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    console.warn(`Blocked a cross-origin request from a disallowed origin: ${origin}`);
+    callback(new Error("Not allowed by CORS"));
+  },
+}));
 app.use(express.json());
 app.use(generalLimiter);   // broad safety net — see middleware/rateLimiters.js for the specific, stricter limiters on login/upload/orders
 
