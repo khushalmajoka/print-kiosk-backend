@@ -35,6 +35,15 @@ const pricing = require("./utils/pricing");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Render (and most hosting platforms) put the app behind a reverse proxy,
+// which adds an X-Forwarded-For header with the visitor's real IP. Without
+// this, Express doesn't trust that header, and express-rate-limit can't
+// tell requests apart by IP — it would end up rate-limiting everyone
+// together as if they were one visitor. "1" means "trust exactly one hop"
+// (Render's own proxy) — not a wildcard, so a client can't spoof this
+// header themselves to bypass rate limiting.
+app.set("trust proxy", 1);
+
 // How long a shopkeeper has to approve an order before it auto-expires.
 const ORDER_EXPIRY_MINUTES = 10;
 // How often the expiry sweep checks for stale orders.
